@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { createRexSession, rexSessionRunning, killRexSession } from "./rex.ts";
 import {
 	accessSync,
 	constants,
@@ -18,11 +18,11 @@ export type RunState = "starting" | "busy" | "idle" | "exited" | "error";
 export interface RunMetadata {
 	version: 1;
 	handle: string;
-	name?: string;
-	parentSessionId?: string;
-	parentSessionFile?: string;
-	childSessionId?: string;
-	tmuxSession: string;
+	name?: string | undefined;
+	parentSessionId?: string | undefined;
+	parentSessionFile?: string | undefined;
+	childSessionId?: string | undefined;
+	rexSession: string;
 	runDir: string;
 	sessionFile: string;
 	cwd: string;
@@ -30,14 +30,14 @@ export interface RunMetadata {
 	model: string;
 	thinking: string;
 	/** Extra pi CLI flags (tools, isolation) reused when the run is relaunched. */
-	launchArgs?: string[];
+	launchArgs?: string[] | undefined;
 	/** Set by the parent when it stops the child on quit or session switch; the child is relaunched on resume. */
-	suspended?: boolean;
+	suspended?: boolean | undefined;
 	state: RunState;
 	hasStarted: boolean;
 	createdAt: string;
 	updatedAt: string;
-	error?: string;
+	error?: string | undefined;
 }
 
 export interface InboxMessage {
@@ -94,32 +94,89 @@ export function runDisplayName(metadata: RunMetadata): string {
 	return metadata.name ? `${metadata.name} (${metadata.handle})` : metadata.handle;
 }
 
+function isMetadataRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isOptionalString(value: unknown): value is string | undefined {
+	return value === undefined || typeof value === "string";
+}
+
+function isOptionalStringArray(value: unknown): value is string[] | undefined {
+	return value === undefined || (Array.isArray(value) && value.every((item: unknown) => typeof item === "string"));
+}
+
+function isRunState(value: unknown): value is RunState {
+	return value === "starting" || value === "busy" || value === "idle" || value === "exited" || value === "error";
+}
+
 export function readMetadata(runDir: string): RunMetadata | undefined {
 	try {
 		const value: unknown = JSON.parse(readFileSync(metadataPath(runDir), "utf8"));
 		if (typeof value !== "object" || value === null) return undefined;
-		const metadata = value as Partial<RunMetadata>;
+		if (!isMetadataRecord(value)) return undefined;
 		if (
-			metadata.version !== 1 ||
-			typeof metadata.handle !== "string" ||
-			(metadata.name !== undefined && !isValidRunName(metadata.name)) ||
-			typeof metadata.tmuxSession !== "string" ||
-			typeof metadata.sessionFile !== "string" ||
-			typeof metadata.runDir !== "string"
-		) {
+			value.version !== 1 ||
+			typeof value.handle !== "string" ||
+			!/^[a-z0-9]+$/.test(value.handle) ||
+			(value.name !== undefined && !isValidRunName(value.name)) ||
+			!isOptionalString(value.parentSessionId) ||
+			!isOptionalString(value.parentSessionFile) ||
+			!isOptionalString(value.childSessionId) ||
+			typeof value.rexSession !== "string" ||
+			typeof value.sessionFile !== "string" ||
+			typeof value.runDir !== "string" ||
+			typeof value.cwd !== "string" ||
+			typeof value.provider !== "string" ||
+			typeof value.model !== "string" ||
+			typeof value.thinking !== "string" ||
+			!isOptionalStringArray(value.launchArgs) ||
+			(value.suspended !== undefined && typeof value.suspended !== "boolean") ||
+			!isRunState(value.state) ||
+			typeof value.hasStarted !== "boolean" ||
+			typeof value.createdAt !== "string" ||
+			typeof value.updatedAt !== "string" ||
+			!isOptionalString(value.error)
+		)
 			return undefined;
-		}
-		return metadata as RunMetadata;
+		return {
+			version: 1,
+			handle: value.handle,
+			name: value.name,
+			parentSessionId: value.parentSessionId,
+			parentSessionFile: value.parentSessionFile,
+			childSessionId: value.childSessionId,
+			rexSession: value.rexSession,
+			sessionFile: value.sessionFile,
+			runDir: value.runDir,
+			cwd: value.cwd,
+			provider: value.provider,
+			model: value.model,
+			thinking: value.thinking,
+			launchArgs: value.launchArgs,
+			suspended: value.suspended,
+			state: value.state,
+			hasStarted: value.hasStarted,
+			createdAt: value.createdAt,
+			updatedAt: value.updatedAt,
+			error: value.error,
+		};
 	} catch {
 		return undefined;
 	}
 }
 
 export function writeMetadata(metadata: RunMetadata): void {
-	mkdirSync(dirname(metadataPath(metadata.runDir)), { recursive: true, mode: 0o700 });
+	mkdirSync(dirname(metadataPath(metadata.runDir)), {
+		recursive: true,
+		mode: 0o700,
+	});
 	const target = metadataPath(metadata.runDir);
 	const temporary = `${target}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
-	writeFileSync(temporary, `${JSON.stringify(metadata, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+	writeFileSync(temporary, `${JSON.stringify(metadata, null, 2)}\n`, {
+		encoding: "utf8",
+		mode: 0o600,
+	});
 	renameSync(temporary, target);
 }
 
@@ -148,14 +205,28 @@ export async function waitForRunShutdown(runDir: string, timeoutMs = 2000): Prom
 }
 
 export function removeRunDir(runDir: string): void {
-	rmSync(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+	rmSync(runDir, {
+		recursive: true,
+		force: true,
+		maxRetries: 10,
+		retryDelay: 50,
+	});
 }
 
-export function tmuxSessionExists(session: string): boolean {
-	return spawnSync("tmux", ["has-session", "-t", session], { stdio: "ignore" }).status === 0;
+/** Translate Rex failures at the existing exception-based lifecycle boundary. */
+export function rexSessionExists(session: string): boolean {
+	const result = rexSessionRunning(session);
+	if (!result.ok) throw new Error(result.error.message);
+	return result.value;
 }
 
-/** Start the child pi process for a run in its tmux session. `initialArgs` are only passed on first spawn. */
+/** Stop a child without discarding metadata if Rex is unavailable. */
+export function stopRun(metadata: RunMetadata): void {
+	const result = killRexSession(metadata.rexSession);
+	if (!result.ok) throw new Error(result.error.message);
+}
+
+/** Start the child Pi process in Rex. `initialArgs` are only passed on first spawn. */
 export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): void {
 	let launcher = "pi";
 	const testLauncher = join(metadata.cwd, "pi-test.sh");
@@ -166,43 +237,43 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): vo
 		// Use the installed pi executable.
 	}
 
-	const result = spawnSync(
-		"tmux",
-		[
-			"new-session",
-			"-d",
-			"-s",
-			metadata.tmuxSession,
-			"-x",
-			"120",
-			"-y",
-			"40",
-			"-c",
-			metadata.cwd,
-			"--",
-			"env",
-			`PI_SUBAGENT_RUN_DIR=${metadata.runDir}`,
-			launcher,
-			"--session",
-			metadata.sessionFile,
-			"--provider",
-			metadata.provider,
-			"--model",
-			metadata.model,
-			"--thinking",
-			metadata.thinking,
-			...(metadata.launchArgs ?? []),
-			...initialArgs,
-		],
-		{ encoding: "utf8" },
-	);
-	if (result.status !== 0) throw new Error(result.stderr.trim() || "Failed to create tmux session");
+	// Rex starts commands in the server environment, not this CLI's environment.
+	const environment = [
+		`PATH=${process.env.PATH ?? ""}`,
+		`PI_CODING_AGENT_DIR=${getAgentDir()}`,
+		`PI_SUBAGENT_RUN_DIR=${metadata.runDir}`,
+	];
+	const result = createRexSession(`pi-subagent-${metadata.handle}`, metadata.cwd, [
+		"/usr/bin/env",
+		...environment,
+		launcher,
+		"--session",
+		metadata.sessionFile,
+		"--provider",
+		metadata.provider,
+		"--model",
+		metadata.model,
+		"--thinking",
+		metadata.thinking,
+		...(metadata.launchArgs ?? []),
+		...initialArgs,
+	]);
+	if (!result.ok) throw new Error(result.error.message);
+	// Merge with the latest child metadata: the bridge can start before rex new returns.
+	try {
+		if (!updateMetadata(metadata.runDir, { rexSession: result.value })) {
+			throw new Error("Subagent metadata disappeared during launch");
+		}
+	} catch (error) {
+		killRexSession(result.value);
+		throw error;
+	}
 }
 
 export function effectiveRunState(metadata: RunMetadata): RunState {
 	if (
 		(metadata.state === "starting" || metadata.state === "busy" || metadata.state === "idle") &&
-		!tmuxSessionExists(metadata.tmuxSession)
+		!rexSessionExists(metadata.rexSession)
 	) {
 		return "exited";
 	}

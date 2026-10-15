@@ -1,4 +1,5 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
+import { rexConnectionArgs, selectRexSession } from "./rex.ts";
 import { existsSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,7 +15,8 @@ import {
 	runDisplayName,
 	type InboxMessage,
 	type RunMetadata,
-	tmuxSessionExists,
+	rexSessionExists,
+	stopRun,
 	updateMetadata,
 	waitForRunShutdown,
 } from "./shared.ts";
@@ -34,12 +36,18 @@ function displayState(metadata: RunMetadata): string {
 export default function subagentExtension(pi: ExtensionAPI) {
 	const runDir = process.env.PI_SUBAGENT_RUN_DIR;
 	if (!runDir) {
-		pi.on("resources_discover", () => ({ skillPaths: [join(packageDir, "skills")] }));
+		pi.on("resources_discover", () => ({
+			skillPaths: [join(packageDir, "skills")],
+		}));
 	}
 
 	pi.registerCommand("subagent", {
 		description: "Select and attach to a subagent spawned by this session",
 		handler: async (_args, ctx) => {
+			if (ctx.mode !== "tui") {
+				ctx.ui.notify("Attach requires interactive terminal mode", "error");
+				return;
+			}
 			const runs = listRuns(ctx.sessionManager.getSessionId()).filter((run) => effectiveRunState(run) !== "exited");
 			if (runs.length === 0) {
 				ctx.ui.notify("No active subagents spawned by this session", "info");
@@ -69,10 +77,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				container.addChild(list);
 				container.addChild(
 					new Text(
-						theme.fg(
-							"dim",
-							`${keyHint("tui.select.confirm", "attach")}  ${keyHint("tui.select.cancel", "cancel")}`,
-						),
+						theme.fg("dim", `${keyHint("tui.select.confirm", "attach")}  ${keyHint("tui.select.cancel", "cancel")}`),
 						1,
 						0,
 					),
@@ -92,20 +97,16 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			const run = runs.find((candidate) => candidate.handle === selected);
 			if (!run) return;
 
-			if (process.env.TMUX) {
-				const exitCode = await new Promise<number | null>((resolveExit) => {
-					const child = spawn("tmux", ["switch-client", "-t", run.tmuxSession], { stdio: "inherit" });
-					child.on("error", () => resolveExit(null));
-					child.on("close", resolveExit);
-				});
-				if (exitCode !== 0) ctx.ui.notify(`Could not switch to ${run.handle}`, "error");
+			if (process.env.REX_SESSION) {
+				const result = selectRexSession(run.rexSession);
+				if (!result.ok) ctx.ui.notify(`Could not switch to ${run.handle}: ${result.error.message}`, "error");
 				return;
 			}
 
 			tui.stop();
 			try {
 				const exitCode = await new Promise<number | null>((resolveExit) => {
-					const child = spawn("tmux", ["attach-session", "-t", run.tmuxSession], { stdio: "inherit" });
+					const child = spawn("rex", [...rexConnectionArgs(), "attach", run.rexSession], { stdio: "inherit" });
 					child.on("error", () => resolveExit(null));
 					child.on("close", resolveExit);
 				});
@@ -131,10 +132,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				return;
 			}
 
+			const theme = widgetContext.ui.theme;
 			const visible = activeRuns.slice(0, 5).map(({ run, state }) => {
 				const color =
 					state === "busy" ? "warning" : state === "idle" ? "success" : state === "error" ? "error" : "muted";
-				return widgetContext!.ui.theme.fg(color, `${run.name ?? run.handle}:${state}`);
+				return theme.fg(color, `${run.name ?? run.handle}:${state}`);
 			});
 			if (activeRuns.length > visible.length) {
 				visible.push(widgetContext.ui.theme.fg("muted", `+${activeRuns.length - visible.length}`));
@@ -149,13 +151,20 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		pi.on("session_start", (_event, ctx) => {
 			// Relaunch children that were suspended when this session was last quit or switched away from.
 			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
-				if (!run.suspended || tmuxSessionExists(run.tmuxSession)) continue;
-				if (!existsSync(run.sessionFile)) {
-					removeRunDir(run.runDir);
-					continue;
-				}
-				const starting = updateMetadata(run.runDir, { state: "starting", error: undefined }) ?? run;
+				if (!run.suspended) continue;
 				try {
+					if (rexSessionExists(run.rexSession)) continue;
+					// Rex can retain an empty session after the previous child exits.
+					stopRun(run);
+					if (!existsSync(run.sessionFile)) {
+						removeRunDir(run.runDir);
+						continue;
+					}
+					const starting =
+						updateMetadata(run.runDir, {
+							state: "starting",
+							error: undefined,
+						}) ?? run;
 					launchRun(starting);
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
@@ -166,8 +175,16 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 			if (!ctx.hasUI) return;
 			widgetContext = ctx;
-			refreshWidget();
-			widgetTimer = setInterval(refreshWidget, 1000);
+			const safeRefresh = (): void => {
+				try {
+					refreshWidget();
+				} catch {
+					// A server outage must not crash Pi or erase durable child records.
+					widgetContext?.ui.setWidget("subagents", ["subagents: Rex unavailable"]);
+				}
+			};
+			safeRefresh();
+			widgetTimer = setInterval(safeRefresh, 1000);
 			widgetTimer.unref();
 		});
 
@@ -180,13 +197,23 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			// Suspend running children: stop the process but keep transcript and metadata so resuming this
 			// session relaunches them. Children that already exited on their own are discarded.
 			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
-				if (!tmuxSessionExists(run.tmuxSession)) {
-					if (!run.suspended) removeRunDir(run.runDir);
-					continue;
+				try {
+					if (!rexSessionExists(run.rexSession)) {
+						stopRun(run);
+						if (!run.suspended) removeRunDir(run.runDir);
+						continue;
+					}
+					updateMetadata(run.runDir, { suspended: true });
+					stopRun(run);
+					await waitForRunShutdown(run.runDir);
+				} catch (error) {
+					// Preserve metadata on control failures so the child can still be managed.
+					if (ctx.hasUI)
+						ctx.ui.notify(
+							`Could not suspend ${runDisplayName(run)}: ${error instanceof Error ? error.message : String(error)}`,
+							"error",
+						);
 				}
-				updateMetadata(run.runDir, { suspended: true });
-				spawnSync("tmux", ["kill-session", "-t", run.tmuxSession], { stdio: "ignore" });
-				await waitForRunShutdown(run.runDir);
 			}
 		});
 		return;
@@ -259,6 +286,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		const metadata = readMetadata(runDir);
 		if (!metadata) return;
 		updateMetadata(runDir, {
+			// Rex injects the owning session ID into the terminal environment.
+			rexSession: process.env.REX_SESSION ?? metadata.rexSession,
 			childSessionId: ctx.sessionManager.getSessionId(),
 			sessionFile: ctx.sessionManager.getSessionFile() ?? metadata.sessionFile,
 			state: ctx.isIdle() ? "idle" : "busy",
@@ -275,7 +304,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 	pi.on("agent_start", (_event, ctx) => {
 		currentContext = ctx;
-		updateMetadata(runDir, { state: "busy", hasStarted: true, error: undefined });
+		updateMetadata(runDir, {
+			state: "busy",
+			hasStarted: true,
+			error: undefined,
+		});
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {

@@ -1,23 +1,30 @@
-# Pi Subagent
+# Pi Subagent for Rex
+
+A Rex-based fork of [earendil-works/pi-subagent](https://github.com/earendil-works/pi-subagent).
 
 Observable, persistent Pi subagents for independent reviews, investigations, and delegated implementation.
 
-Each subagent runs in its own tmux session with a dedicated Pi JSONL session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or attach directly to the child TUI.
+Each subagent runs in its own Rex session with a dedicated Pi JSONL session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or attach directly to the child TUI.
 
 ## Requirements
 
 - Pi
 - Node.js 22.19 or newer
-- tmux
+- Rex on `PATH` (tested with `0.0.1791811459-ga601bc`)
 
 ## Install
 
-Clone into Pi's global extension directory and expose the CLI on `PATH`:
+Clone the fork, register the local package, and expose the CLI on `PATH`:
 
 ```sh
-git clone git@github.com:earendil-works/pi-subagent.git ~/.pi/agent/extensions/subagent
-ln -s ../extensions/subagent/subagent.ts ~/.pi/agent/bin/subagent
+mkdir -p ~/git
+jj git clone https://github.com/ayatofrench/pi-subagent ~/git/pi-subagent
+pi install ~/git/pi-subagent
+mkdir -p ~/.pi/agent/bin
+ln -s ~/git/pi-subagent/subagent.ts ~/.pi/agent/bin/subagent
 ```
+
+Ensure `~/.pi/agent/bin` is on `PATH`. Disable other subagent extensions before enabling this package. The local checkout remains the source for updates.
 
 Run `/reload` in an existing Pi session. The extension contributes its bundled skill automatically.
 
@@ -69,6 +76,27 @@ subagent list
 ```
 
 Use `/subagent` to select and attach to an active child. The status widget shows active names (or handles for unnamed runs) and their current state.
+
+## Rex behavior
+
+- Children start as detached sessions labeled `pi-subagent-<handle>`. Metadata records the stable Rex session ID.
+- Commands and prompts are passed as literal arguments with `--shell none`. The child receives the spawning process's `PATH` and Pi agent directory, not only the Rex server's environment.
+- Inside Rex, `/subagent` uses the app's `session.select` action. `REX_CLIENT` selects a client; without it, Rex requires exactly one connected app. Return to the parent with Rex's session picker. If selection fails, Pi reports the error instead of opening a nested terminal.
+- Outside Rex, `/subagent` temporarily stops Pi's TUI and runs `rex attach`. Detach with Rex's configured detach key to return to Pi.
+- Rex keeps empty sessions after commands exit. Status checks inspect the child block; stop and parent shutdown also remove the empty session.
+- Control commands use the current `REX_SERVER` or Rex's default server. Keep the same server when managing or resuming runs. Server errors are reported, not treated as missing children.
+- Existing upstream run records are not supported. Finish and stop old runs with their original implementation before switching.
+
+## Tests
+
+```sh
+npm ci --ignore-scripts
+npm run check
+npm test
+RUN_REX_TESTS=1 npm test
+```
+
+The opt-in suite uses temporary Rex sessions and the upstream `pi-test.sh` launcher seam. It tests literal arguments, environment, process exit, CLI spawn/status/send/wait/stop, and transcript reuse on relaunch without model calls. Test sessions are removed afterward. It does not test live model output, the interactive picker, app selection, or terminal attachment.
 
 ## Isolation
 

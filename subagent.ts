@@ -2,7 +2,6 @@
 
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -19,7 +18,8 @@ import {
 	isValidRunName,
 	type InboxMessage,
 	type RunMetadata,
-	tmuxSessionExists,
+	rexSessionExists,
+	stopRun,
 	updateMetadata,
 	waitForRunShutdown,
 	writeMetadata,
@@ -158,7 +158,7 @@ function spawnSubagent(args: string[]): void {
 	const handle = generateHandle();
 	const runDir = runDirForHandle(handle);
 	const sessionFile = join(runDir, "session.jsonl");
-	const tmuxSession = `pi-subagent-${handle}`;
+	const rexSession = `pi-subagent-${handle}`;
 	mkdirSync(inboxDir(runDir), { recursive: true, mode: 0o700 });
 	writeFileSync(sessionFile, "", { mode: 0o600 });
 
@@ -176,7 +176,7 @@ function spawnSubagent(args: string[]): void {
 		name,
 		parentSessionId: process.env.PI_SESSION_ID || undefined,
 		parentSessionFile: process.env.PI_SESSION_FILE || undefined,
-		tmuxSession,
+		rexSession,
 		runDir,
 		sessionFile,
 		cwd,
@@ -196,23 +196,29 @@ function spawnSubagent(args: string[]): void {
 	try {
 		launchRun(metadata, initialArgs);
 	} catch (error) {
-		removeRunDir(runDir);
-		throw error;
+		// A timed-out create may have reached Rex. Keep the label and transcript for cleanup.
+		updateMetadata(runDir, {
+			state: "error",
+			error: error instanceof Error ? error.message : String(error),
+		});
+		throw new Error(
+			`Could not launch ${handle}; run metadata retained for subagent stop: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
 
-	process.stdout.write(`Spawned ${runDisplayName(metadata)}\nState: busy\nAttach: tmux attach -t ${tmuxSession}\n`);
+	process.stdout.write(`Spawned ${runDisplayName(metadata)}\nState: busy\nAttach: rex attach ${rexSession}\n`);
 }
 
 function statusSubagent(args: string[]): void {
-	if (args.length !== 1) usage();
+	if (args.length !== 1 || args[0] === undefined) usage();
 	const metadata = getRun(args[0]);
 	process.stdout.write(
-		`${runDisplayName(metadata)}: ${effectiveRunState(metadata)} (${metadata.provider}/${metadata.model}, ${metadata.thinking})\nAttach: tmux attach -t ${metadata.tmuxSession}\n`,
+		`${runDisplayName(metadata)}: ${effectiveRunState(metadata)} (${metadata.provider}/${metadata.model}, ${metadata.thinking})\nAttach: rex attach ${metadata.rexSession}\n`,
 	);
 }
 
 function renameSubagent(args: string[]): void {
-	if (args.length !== 2) usage();
+	if (args.length !== 2 || args[0] === undefined || args[1] === undefined) usage();
 	const metadata = getRun(args[0]);
 	const name = normalizeRunName(args[1]);
 	const updated = updateMetadata(metadata.runDir, { name });
@@ -233,15 +239,21 @@ function sendSubagent(args: string[]): void {
 	const message = messageParts.join(" ").trim();
 	if (!message) fail("send requires a message");
 	const metadata = getRun(handle);
-	if (!tmuxSessionExists(metadata.tmuxSession)) fail(`${handle} is not running`);
+	if (!rexSessionExists(metadata.rexSession)) fail(`${handle} is not running`);
 
 	const queueDir = inboxDir(metadata.runDir);
 	mkdirSync(queueDir, { recursive: true, mode: 0o700 });
 	const id = `${Date.now()}-${randomBytes(4).toString("hex")}`;
 	const target = join(queueDir, `${id}.json`);
 	const temporary = `${target}.tmp`;
-	const payload: InboxMessage = { message, delivery: followUp ? "followUp" : "auto" };
-	writeFileSync(temporary, `${JSON.stringify(payload)}\n`, { encoding: "utf8", mode: 0o600 });
+	const payload: InboxMessage = {
+		message,
+		delivery: followUp ? "followUp" : "auto",
+	};
+	writeFileSync(temporary, `${JSON.stringify(payload)}\n`, {
+		encoding: "utf8",
+		mode: 0o600,
+	});
 	renameSync(temporary, target);
 
 	const state = effectiveRunState(metadata);
@@ -284,10 +296,10 @@ async function waitSubagent(args: string[]): Promise<void> {
 }
 
 async function stopSubagent(args: string[]): Promise<void> {
-	if (args.length !== 1) usage();
+	if (args.length !== 1 || args[0] === undefined) usage();
 	const metadata = getRun(args[0]);
-	const wasRunning = tmuxSessionExists(metadata.tmuxSession);
-	spawnSync("tmux", ["kill-session", "-t", metadata.tmuxSession], { stdio: "ignore" });
+	const wasRunning = rexSessionExists(metadata.rexSession);
+	stopRun(metadata);
 	if (wasRunning) await waitForRunShutdown(metadata.runDir);
 	removeRunDir(metadata.runDir);
 	process.stdout.write(`Stopped ${runDisplayName(metadata)}\n`);
